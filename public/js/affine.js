@@ -30,6 +30,14 @@
  * 越界邻点视为透明黑；颜色先乘 alpha 再插值、输出时还原，alpha 为零时
  * RGB 归零；各通道四舍五入到 0~255。矩阵含非有限值或线性部分行列式绝对值
  * ≤ MIN_MATRIX_DET（1e-12）时拒绝（checkExportMatrix / invertMatrix）。
+ *
+ * 差异区域分析（findDiffRegions，可独立调用，纯像素计算、不依赖 DOM）：
+ * 逐像素比较两幅同尺寸 RGBA 图像（通常为参考图与校准后扫描图的重采样结果），
+ * 仅统计双方 alpha 均不低于 ALPHA_CUTOFF（128）的像素，任一 RGB 通道差值
+ * 绝对值严格大于 threshold 即标为差异（diffMaskRGBA）；对差异掩码做八邻域
+ * 连通分组（labelRegions），过滤面积（像素数）小于 minArea 的区域，按面积
+ * 降序返回各区域的像素数与含端点的边框坐标范围（同面积保持扫描顺序，
+ * 结果可复现）。
  */
 (function (root, factory) {
   const api = factory();
@@ -49,6 +57,12 @@
   const DEFAULT_TOLERANCE_PX = 2;
   // 像素变换/导出可用性的矩阵阈值：线性部分行列式 |a·e − b·d| 下限
   const MIN_MATRIX_DET = 1e-12;
+  // 差异区域分析：默认 RGB 通道差值阈值（0~255，严格大于才计为差异）
+  const DEFAULT_DIFF_THRESHOLD = 32;
+  // 差异区域分析：默认最小区域面积（像素），小于该面积的连通区域被过滤
+  const DEFAULT_DIFF_MIN_AREA = 16;
+  // 差异区域分析：参与逐像素比较的 alpha 下限（双方均不低于该值才统计）
+  const ALPHA_CUTOFF = 128;
 
   class FitError extends Error {
     constructor(code, message) {
@@ -515,6 +529,135 @@
     return out;
   }
 
+  /**
+   * 逐像素比较两幅同尺寸 RGBA 图像，生成差异掩码（可独立调用，纯像素计算）。
+   *
+   * 仅统计双方 alpha 均不低于 ALPHA_CUTOFF（128）的像素；任一 RGB 通道
+   * 差值绝对值严格大于 threshold（0~255）即把掩码对应位置 1。
+   *
+   * @param {Uint8Array|Uint8ClampedArray} refData 参考 RGBA 数据
+   * @param {Uint8Array|Uint8ClampedArray} cmpData 待比较 RGBA 数据（如校准后扫描图）
+   * @param {number} width 图像宽（正整数）
+   * @param {number} height 图像高（正整数）
+   * @param {number} threshold 通道差值阈值（0~255 的有限数字）
+   * @returns {{mask: Uint8Array, diffCount: number, comparedCount: number}}
+   *          mask 长度 width·height，差异像素为 1；diffCount 为差异像素数；
+   *          comparedCount 为实际参与比较（双方 alpha 达标）的像素数
+   * @throws {FitError} code = BAD_INPUT
+   */
+  function diffMaskRGBA(refData, cmpData, width, height, threshold) {
+    if (!refData || !cmpData || !Number.isInteger(width) || !Number.isInteger(height) ||
+        width <= 0 || height <= 0 ||
+        refData.length !== width * height * 4 || cmpData.length !== width * height * 4) {
+      throw new FitError('BAD_INPUT', '比较图像数据缺失或长度与宽高不符');
+    }
+    if (!Number.isFinite(threshold) || threshold < 0 || threshold > 255) {
+      throw new FitError('BAD_INPUT', '通道差值阈值必须为 0~255 的数字');
+    }
+    const n = width * height;
+    const mask = new Uint8Array(n);
+    let diffCount = 0;
+    let comparedCount = 0;
+    for (let p = 0, i = 0; p < n; p++, i += 4) {
+      if (refData[i + 3] < ALPHA_CUTOFF || cmpData[i + 3] < ALPHA_CUTOFF) continue;
+      comparedCount++;
+      if (Math.abs(refData[i] - cmpData[i]) > threshold ||
+          Math.abs(refData[i + 1] - cmpData[i + 1]) > threshold ||
+          Math.abs(refData[i + 2] - cmpData[i + 2]) > threshold) {
+        mask[p] = 1;
+        diffCount++;
+      }
+    }
+    return { mask, diffCount, comparedCount };
+  }
+
+  /**
+   * 差异掩码的八邻域连通分组（可独立调用，不修改传入掩码）。
+   *
+   * 对角相邻（八邻域）的像素属于同一区域；面积（像素数）小于 minArea 的
+   * 区域被过滤；结果按面积降序排列（同面积保持扫描顺序，结果可复现）。
+   *
+   * @param {Uint8Array} mask 差异掩码（长度 width·height，差异像素为 1）
+   * @param {number} width 图像宽（正整数）
+   * @param {number} height 图像高（正整数）
+   * @param {number} minArea 最小区域面积（≥ 1 的有限数字，保留面积 ≥ minArea 的区域）
+   * @returns {Array<{area:number, minX:number, minY:number, maxX:number, maxY:number}>}
+   *          area 为区域像素数；(minX, minY)~(maxX, maxY) 为含端点的边框像素坐标
+   * @throws {FitError} code = BAD_INPUT
+   */
+  function labelRegions(mask, width, height, minArea) {
+    if (!mask || !Number.isInteger(width) || !Number.isInteger(height) ||
+        width <= 0 || height <= 0 || mask.length !== width * height) {
+      throw new FitError('BAD_INPUT', '差异掩码缺失或长度与宽高不符');
+    }
+    if (!Number.isFinite(minArea) || minArea < 1) {
+      throw new FitError('BAD_INPUT', '最小区域面积必须为不小于 1 的数字');
+    }
+    const n = width * height;
+    const visited = new Uint8Array(n); // 1 = 已归属某区域
+    const stack = new Int32Array(n);   // 洪泛栈（每个像素至多入栈一次，容量足够）
+    const regions = [];
+    for (let s = 0; s < n; s++) {
+      if (mask[s] !== 1 || visited[s]) continue;
+      let area = 0;
+      let minX = width, minY = height, maxX = -1, maxY = -1;
+      let top = 0;
+      stack[top++] = s;
+      visited[s] = 1;
+      while (top > 0) {
+        const cur = stack[--top];
+        const cx = cur % width;
+        const cy = (cur / width) | 0;
+        area++;
+        if (cx < minX) minX = cx;
+        if (cx > maxX) maxX = cx;
+        if (cy < minY) minY = cy;
+        if (cy > maxY) maxY = cy;
+        // 八邻域扩散
+        for (let dy = -1; dy <= 1; dy++) {
+          const ny = cy + dy;
+          if (ny < 0 || ny >= height) continue;
+          for (let dx = -1; dx <= 1; dx++) {
+            if (dx === 0 && dy === 0) continue;
+            const nx = cx + dx;
+            if (nx < 0 || nx >= width) continue;
+            const ni = ny * width + nx;
+            if (mask[ni] === 1 && !visited[ni]) {
+              visited[ni] = 1; // 入栈即标记，保证每像素至多入栈一次
+              stack[top++] = ni;
+            }
+          }
+        }
+      }
+      if (area >= minArea) regions.push({ area, minX, minY, maxX, maxY });
+    }
+    // 面积降序；Array.sort 稳定，同面积保持扫描顺序
+    regions.sort((a, b) => b.area - a.area);
+    return regions;
+  }
+
+  /**
+   * 差异区域分析：diffMaskRGBA + labelRegions 的组合（可独立调用）。
+   *
+   * @param {Uint8Array|Uint8ClampedArray} refData 参考 RGBA 数据
+   * @param {Uint8Array|Uint8ClampedArray} cmpData 待比较 RGBA 数据
+   * @param {number} width 图像宽（正整数）
+   * @param {number} height 图像高（正整数）
+   * @param {{threshold?:number, minArea?:number}} [options]
+   *        threshold 缺省 DEFAULT_DIFF_THRESHOLD（32）；minArea 缺省 DEFAULT_DIFF_MIN_AREA（16）
+   * @returns {{mask: Uint8Array, regions: Array, diffCount: number,
+   *            comparedCount: number, threshold: number, minArea: number}}
+   * @throws {FitError} code = BAD_INPUT
+   */
+  function findDiffRegions(refData, cmpData, width, height, options) {
+    const opts = options || {};
+    const threshold = opts.threshold === undefined ? DEFAULT_DIFF_THRESHOLD : opts.threshold;
+    const minArea = opts.minArea === undefined ? DEFAULT_DIFF_MIN_AREA : opts.minArea;
+    const { mask, diffCount, comparedCount } = diffMaskRGBA(refData, cmpData, width, height, threshold);
+    const regions = labelRegions(mask, width, height, minArea);
+    return { mask, regions, diffCount, comparedCount, threshold, minArea };
+  }
+
   return {
     fitAffine,
     fitAffineRobust,
@@ -524,12 +667,18 @@
     checkExportMatrix,
     invertMatrix,
     transformRGBA,
+    diffMaskRGBA,
+    labelRegions,
+    findDiffRegions,
     FitError,
     MIN_POINTS,
     COLLINEAR_RATIO,
     MAX_CANDIDATES,
     MAX_REFINE_ITERS,
     DEFAULT_TOLERANCE_PX,
-    MIN_MATRIX_DET
+    MIN_MATRIX_DET,
+    DEFAULT_DIFF_THRESHOLD,
+    DEFAULT_DIFF_MIN_AREA,
+    ALPHA_CUTOFF
   };
 });

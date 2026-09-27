@@ -9,7 +9,7 @@
 <body>
   <header>
     <h1>扫描印刷稿套色偏移校准</h1>
-    <p class="sub">上传参考图与扫描图 → 成对点击控制点（≥ 3 对）→ 仿射拟合（可切换稳健模式剔除误标点）→ 叠加预览、残差分析与校准图导出</p>
+    <p class="sub">上传参考图与扫描图 → 成对点击控制点（≥ 3 对）→ 仿射拟合（可切换稳健模式剔除误标点）→ 叠加预览、差异区域分析、残差分析与校准图导出</p>
   </header>
 
   <section class="toolbar">
@@ -73,6 +73,38 @@
       <span id="opacityVal">50%</span>
     </div>
     <canvas id="overlayCanvas"></canvas>
+  </section>
+
+  <section class="diff-wrap">
+    <h2>差异区域</h2>
+    <div class="diff-controls">
+      <label class="opt-label tol-label" for="diffThreshold"
+             title="任一 RGB 通道差值绝对值超过该阈值即标为差异（仅统计双方 alpha ≥ 128 的像素）">
+        通道差值阈值
+        <input type="number" id="diffThreshold" min="0" max="255" step="1" value="32">
+      </label>
+      <label class="opt-label tol-label" for="diffMinArea"
+             title="差异掩码八邻域连通分组后，面积（像素数）小于该值的区域不列入结果">
+        最小区域面积
+        <input type="number" id="diffMinArea" min="1" max="100000000" step="1" value="16">
+        px
+      </label>
+      <span id="diffSummary" class="diff-summary"></span>
+    </div>
+    <p id="diffHint" class="diff-hint"></p>
+    <div class="diff-grid">
+      <canvas id="diffCanvas"></canvas>
+      <div class="diff-side">
+        <table id="diffTable">
+          <thead>
+            <tr>
+              <th>#</th><th>像素数</th><th>X 范围（参考图）</th><th>Y 范围（参考图）</th><th>边框 (宽×高)</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
   </section>
 
   <footer>

@@ -479,4 +479,98 @@ const IDENTITY = { a: 1, b: 0, c: 0, d: 0, e: 1, f: 0 };
   console.log('✓ invertMatrix 逆映射正确，奇异矩阵抛 BAD_MATRIX');
 }
 
+// ---------- 差异区域分析 diffMaskRGBA / labelRegions / findDiffRegions ----------
+
+// 36. 完全相同的不透明图像：无差异，全部像素参与比较
+{
+  const img = new Uint8ClampedArray([10, 20, 30, 255, 200, 100, 50, 255]);
+  const r = Affine.findDiffRegions(img, img, 2, 1, { threshold: 32, minArea: 1 });
+  assert.strictEqual(r.diffCount, 0);
+  assert.strictEqual(r.comparedCount, 2);
+  assert.strictEqual(r.regions.length, 0);
+  assert.ok(r.mask instanceof Uint8Array);
+  assert.strictEqual(r.mask.length, 2);
+  console.log('✓ 差异区域：相同图像无差异，全部像素参与比较');
+}
+
+// 37. alpha 门槛：仅统计双方 alpha 均 ≥ 128 的像素
+{
+  const ref = new Uint8ClampedArray([0, 0, 0, 127, 0, 0, 0, 128, 0, 0, 0, 255]);
+  const cmp = new Uint8ClampedArray([255, 255, 255, 255, 255, 255, 255, 127, 255, 255, 255, 255]);
+  const r = Affine.findDiffRegions(ref, cmp, 3, 1, { threshold: 32, minArea: 1 });
+  assert.strictEqual(r.comparedCount, 1, '仅第 3 个像素双方 alpha 均 ≥ 128');
+  assert.strictEqual(r.diffCount, 1);
+  assert.strictEqual(r.mask[0], 0, 'ref alpha 127 不参与比较');
+  assert.strictEqual(r.mask[1], 0, 'cmp alpha 127 不参与比较');
+  assert.strictEqual(r.mask[2], 1);
+  console.log('✓ 差异区域：仅统计双方 alpha ≥ 128 的像素');
+}
+
+// 38. 通道阈值：差值须严格大于阈值；任一 RGB 通道超限即标为差异
+{
+  const ref = new Uint8ClampedArray([100, 100, 100, 255, 100, 100, 100, 255, 100, 100, 100, 255]);
+  const cmp = new Uint8ClampedArray([132, 100, 100, 255, 133, 100, 100, 255, 100, 100, 133, 255]);
+  const r = Affine.findDiffRegions(ref, cmp, 3, 1, { threshold: 32, minArea: 1 });
+  assert.strictEqual(r.mask[0], 0, '差值等于阈值不算差异（严格大于）');
+  assert.strictEqual(r.mask[1], 1, 'R 通道超限即标记');
+  assert.strictEqual(r.mask[2], 1, 'B 通道超限即标记');
+  assert.strictEqual(r.diffCount, 2);
+  console.log('✓ 差异区域：通道差值严格大于阈值才计入，任一通道超限即标记');
+}
+
+// 39. 八邻域连通分组：对角相邻算同一区域；最小面积过滤；按面积降序；边框坐标含端点
+{
+  const w = 10, h = 4;
+  const mask = new Uint8Array(w * h);
+  const set = (x, y) => { mask[y * w + x] = 1; };
+  set(0, 0); set(1, 0); set(0, 1); set(1, 1); // 2×2 方块，面积 4
+  set(5, 1); set(6, 2);                        // 对角相邻两像素，面积 2（八邻域为同一区域）
+  set(9, 3);                                   // 孤立像素，面积 1
+  const all = Affine.labelRegions(mask, w, h, 1);
+  assert.strictEqual(all.length, 3);
+  assert.deepStrictEqual(all.map((r) => r.area), [4, 2, 1], '应按面积降序排列');
+  assert.deepStrictEqual(all[0], { area: 4, minX: 0, minY: 0, maxX: 1, maxY: 1 });
+  assert.deepStrictEqual(all[1], { area: 2, minX: 5, minY: 1, maxX: 6, maxY: 2 },
+    '对角相邻应归为同一区域（八邻域）');
+  assert.deepStrictEqual(all[2], { area: 1, minX: 9, minY: 3, maxX: 9, maxY: 3 });
+  assert.deepStrictEqual(Affine.labelRegions(mask, w, h, 3).map((r) => r.area), [4],
+    '小于最小面积的区域应被过滤');
+  assert.strictEqual(Affine.labelRegions(mask, w, h, 5).length, 0);
+  assert.strictEqual(mask[0], 1, '分组不得修改传入的掩码');
+  console.log('✓ 差异区域：八邻域分组、最小面积过滤、按面积降序与边框坐标');
+}
+
+// 40. 非法参数拒绝；默认参数可用
+{
+  const img = new Uint8ClampedArray(4 * 4);
+  assert.throws(() => Affine.findDiffRegions(img, img, 2, 2, { threshold: -1 }), (e) => e.code === 'BAD_INPUT');
+  assert.throws(() => Affine.findDiffRegions(img, img, 2, 2, { threshold: 256 }), (e) => e.code === 'BAD_INPUT');
+  assert.throws(() => Affine.findDiffRegions(img, img, 2, 2, { threshold: NaN }), (e) => e.code === 'BAD_INPUT');
+  assert.throws(() => Affine.findDiffRegions(img, img, 2, 2, { minArea: 0 }), (e) => e.code === 'BAD_INPUT');
+  assert.throws(() => Affine.findDiffRegions(img, new Uint8ClampedArray(4), 2, 2), (e) => e.code === 'BAD_INPUT');
+  assert.throws(() => Affine.findDiffRegions(null, img, 2, 2), (e) => e.code === 'BAD_INPUT');
+  assert.throws(() => Affine.labelRegions(new Uint8Array(3), 2, 2, 1), (e) => e.code === 'BAD_INPUT');
+  const r = Affine.findDiffRegions(img, img, 2, 2);
+  assert.strictEqual(r.threshold, Affine.DEFAULT_DIFF_THRESHOLD);
+  assert.strictEqual(r.minArea, Affine.DEFAULT_DIFF_MIN_AREA);
+  console.log('✓ 差异区域：非法阈值/面积/尺寸拒绝，默认参数可用');
+}
+
+// 41. 与 transformRGBA 配合：复用重采样结果逐像素比较（错位 1px → 1 个差异区域）
+{
+  // 扫描图 6×1：左黑右白（边界在 x=3）；以其自身为参考图
+  const scan = new Uint8ClampedArray(6 * 4);
+  for (let x = 0; x < 6; x++) {
+    const v = x < 3 ? 0 : 255;
+    scan.set([v, v, v, 255], x * 4);
+  }
+  // 矩阵 c=1（右移 1px）：校准结果边界错位 1px，第 0 列越界为透明黑（不参与比较）
+  const calib = Affine.transformRGBA(scan, 6, 1, { a: 1, b: 0, c: 1, d: 0, e: 1, f: 0 }, 6, 1);
+  const r = Affine.findDiffRegions(scan, calib, 6, 1, { threshold: 32, minArea: 1 });
+  assert.strictEqual(r.comparedCount, 5, '越界透明像素不参与比较');
+  assert.strictEqual(r.diffCount, 1);
+  assert.deepStrictEqual(r.regions, [{ area: 1, minX: 3, minY: 0, maxX: 3, maxY: 0 }]);
+  console.log('✓ 差异区域：复用 transformRGBA 重采样结果逐像素比较（错位 1px → 1 区域）');
+}
+
 console.log('\n全部测试通过 ✔');
