@@ -21,9 +21,16 @@ const els = {};
 function makeCtx() {
   return new Proxy({}, {
     get: (t, k) => {
-      // 导出校准扫描图需要读取源像素：返回长度正确的 RGBA 缓冲
+      // 导出校准扫描图与差异比较需要真实长度的 RGBA 缓冲（白底不透明）
       if (k === 'getImageData') {
-        return (x, y, w, h) => ({ data: new Uint8ClampedArray(w * h * 4), width: w, height: h });
+        return (x, y, w, h) => {
+          const data = new Uint8ClampedArray(w * h * 4).fill(255);
+          return { data, width: w, height: h };
+        };
+      }
+      // 差异遮罩需要可写的 ImageData
+      if (k === 'createImageData') {
+        return (w, h) => ({ data: new Uint8ClampedArray(w * h * 4), width: w, height: h });
       }
       return () => {};
     },
@@ -91,7 +98,9 @@ const fire = (el, type, ev = {}) => (el.listeners[type] || []).forEach((fn) => f
 const clickCanvas = (canvas, x, y) =>
   fire(canvas, 'mousedown', { button: 0, clientX: x, clientY: y, preventDefault() {} });
 const tick = () => new Promise((r) => setImmediate(r));
+const waitMs = (ms) => new Promise((r) => setTimeout(r, ms));
 const rowCount = () => (els.ptTable.querySelector('tbody').innerHTML.match(/<tr/g) || []).length;
+const diffRowCount = () => (els.diffTable.querySelector('tbody').innerHTML.match(/<tr/g) || []).length;
 
 (async () => {
   // 0. app.js 引用的 id 必须都存在于 index.html
@@ -338,6 +347,70 @@ const rowCount = () => (els.ptTable.querySelector('tbody').innerHTML.match(/<tr/
   assert.strictEqual(mj3.pointCount, 5);
   assert.strictEqual(mj3.looValidation.verifiableCount, 5);
   console.log('✓ 关闭稳健模式后回到经典最小二乘（导出 mode/rmseScope 对应，留出验证同步）');
+
+  console.log('✓ 关闭稳健模式后回到经典最小二乘（导出 mode/rmseScope 对应，留出验证同步）');
+
+  // 14. 差异区域视图：图像缺失时清空标记并说明原因（初始状态）
+  // （初始渲染已断言导出禁用；这里直接验证 diff 视图的专属提示文案）
+  fire(els.btnClear, 'click');
+  await waitMs(120);
+  // 当前仍有示例图像，但无拟合矩阵：应提示控制点不足，表格清空
+  assert.ok(els.diffHint.textContent.includes('控制点不足'),
+    '无拟合矩阵时应说明原因: ' + els.diffHint.textContent);
+  assert.strictEqual(diffRowCount(), 0, '条件失效时差异表必须清空');
+  console.log('✓ 差异区域：拟合矩阵不可用时清空旧标记并说明原因');
+
+  // 15. 差异区域：4 对精确点拟合后更新（白底对白底 → 无差异像素）
+  for (const rp of refPts) {
+    clickCanvas(els.refCanvas, rp[0], rp[1]);
+    const sp = scanPt(rp);
+    clickCanvas(els.scanCanvas, sp[0], sp[1]);
+  }
+  await waitMs(150);
+  assert.strictEqual(els.diffCanvas.width, 960, '差异画布尺寸应等于参考图原始宽高');
+  assert.strictEqual(els.diffCanvas.height, 640);
+  assert.ok(els.diffHint.textContent.includes('参与比较像素'),
+    '拟合有效后应给出比较统计: ' + els.diffHint.textContent);
+  assert.ok(els.diffHint.textContent.includes('alpha ≥ 128'));
+  assert.ok(els.diffHint.textContent.includes('差异像素：0'),
+    '同图（仅仿射对齐）白底比较应无差异: ' + els.diffHint.textContent);
+  assert.strictEqual(diffRowCount(), 0);
+  console.log('✓ 差异区域：拟合成功后复用重采样结果逐像素比较（无差异时 0 区域）');
+
+  // 16. 阈值 / 最小面积为非法值时：清空标记并说明原因
+  els.diffThreshold.value = '300';
+  fire(els.diffThreshold, 'input');
+  await waitMs(120);
+  assert.ok(els.diffHint.textContent.includes('阈值'), '非法阈值应说明原因: ' + els.diffHint.textContent);
+  assert.strictEqual(diffRowCount(), 0);
+  els.diffThreshold.value = '32';
+  fire(els.diffThreshold, 'input');
+  await waitMs(120);
+  assert.ok(els.diffHint.textContent.includes('参与比较像素'), '合法阈值应恢复比较');
+  els.diffMinArea.value = '-5';
+  fire(els.diffMinArea, 'input');
+  await waitMs(120);
+  assert.ok(els.diffHint.textContent.includes('最小区域面积'), '非法面积应说明原因');
+  assert.strictEqual(diffRowCount(), 0);
+  els.diffMinArea.value = '20';
+  fire(els.diffMinArea, 'input');
+  await waitMs(120);
+  assert.ok(els.diffHint.textContent.includes('最小面积 20'));
+  console.log('✓ 差异区域：阈值/面积非法时清空并说明，合法值恢复更新');
+
+  // 17. 切换稳健模式后差异视图跟随重算；条件失效（删点至不足）再次清空
+  els.robustMode.checked = true;
+  fire(els.robustMode, 'change');
+  await waitMs(150);
+  assert.ok(els.diffHint.textContent.includes('参与比较像素'), '模式变化后差异结果应更新');
+  fire(els.refCanvas, 'contextmenu', { clientX: refPts[0][0], clientY: refPts[0][1], preventDefault() {} });
+  fire(els.refCanvas, 'contextmenu', { clientX: refPts[1][0], clientY: refPts[1][1], preventDefault() {} });
+  await waitMs(150);
+  assert.ok(els.diffHint.textContent.includes('控制点不足'), '矩阵失效后应清空并说明');
+  assert.strictEqual(diffRowCount(), 0);
+  els.robustMode.checked = false;
+  fire(els.robustMode, 'change');
+  console.log('✓ 差异区域：点位/拟合模式变化后更新，矩阵失效时清空旧标记');
 
   console.log('\n前端冒烟测试全部通过 ✔');
 })().catch((err) => {

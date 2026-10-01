@@ -19,6 +19,13 @@
  *    点集近共线显示「无法验证」，稳健模式外点显示「不参与」；状态栏与拟合面板
  *    汇总可验证点的 RMSE / 最大误差（零个可验证点时显示不可用），最差点橙色标出。
  *    点位增删/拖动、模式与容差变化均实时重算。
+ *  - 「差异区域」视图：两图已加载且当前拟合矩阵可导出（与校准扫描图导出同一
+ *    条件）时，复用校准扫描图的 transformRGBA RGBA 重采样结果（同尺寸同矩阵时
+ *    缓存复用），与参考图逐像素比较；仅统计双方 alpha 均 ≥ 128 的像素，任一
+ *    RGB 通道差值严格大于可调阈值即标为差异；差异掩码做八邻域连通分组，过滤
+ *    像素数小于可调最小面积的区域，按面积降序展示边框、像素数与参考图坐标范围。
+ *    阈值 / 面积 / 点位 / 拟合模式（含容差）变化后更新；条件失效时清空旧标记
+ *    并说明原因。像素处理全部在浏览器本地完成，图像不上传服务器。
  */
 (function () {
   'use strict';
@@ -35,14 +42,25 @@
     robust: false,           // 是否启用稳健模式
     tolerancePx: Affine.DEFAULT_TOLERANCE_PX, // 稳健模式参考图像素容差
     dragging: null,          // {id, which:'ref'|'scan'}
-    opacity: 0.5
+    opacity: 0.5,
+    diffThreshold: 32,       // 差异区域：RGB 通道差值阈值（差异为严格大于）
+    diffMinArea: 20          // 差异区域：最小连通区域面积（像素）
   };
+
+  // 校准扫描图 RGBA 重采样缓存（差异视图与 PNG 导出共用）：
+  // { token, matrixKey, outW, outH, pixels }；图像/矩阵变化后失效
+  let calibratedCache = null;
+  let imageSeq = 0;          // 为每张载入的图像分配唯一 token
+  let diffTimer = null;      // 差异视图防抖句柄（拖动等高频更新时合并计算）
+  const DIFF_DEBOUNCE_MS = 60;
 
   const HIT_RADIUS_CSS = 12;   // 命中半径（CSS 像素）
   const COLOR_INLIER = '#22c55e';   // 内点：绿
   const COLOR_OUTLIER = '#ef4444';  // 外点：红（虚线）
   const COLOR_MAX = '#f59e0b';      // 内点中最大残差：橙
   const COLOR_PENDING = '#eab308';
+  const COLOR_DIFF_TINT = 'rgba(239, 68, 68, 0.55)'; // 差异像素遮罩
+  const COLOR_DIFF_BOX = '#f87171';                   // 差异区域边框
 
   // ---------- DOM ----------
   const $ = (id) => document.getElementById(id);
@@ -63,6 +81,11 @@
   const robustModeInput = $('robustMode');
   const toleranceInput = $('tolerance');
   const tolLabel = $('tolLabel');
+  const diffCanvas = $('diffCanvas');
+  const diffHintEl = $('diffHint');
+  const diffTableBody = $('diffTable').querySelector('tbody');
+  const diffThresholdInput = $('diffThreshold');
+  const diffMinAreaInput = $('diffMinArea');
 
   // ---------- 图像加载 ----------
   function loadImageFromFile(file) {
@@ -84,7 +107,9 @@
     if (!file) return;
     try {
       const img = await loadImageFromFile(file);
+      img.imageToken = ++imageSeq;
       if (which === 'ref') state.refImg = img; else state.scanImg = img;
+      calibratedCache = null; // 图像更换后重采样结果失效
       clearPoints(); // 图像更换后旧坐标失效，清空控制点
     } catch (err) {
       setStatus(err.message, 'error');
@@ -127,6 +152,7 @@
       }
     }
     render();
+    scheduleDiffUpdate(); // 点位/模式/容差变化后刷新差异区域（条件失效时清空并说明）
   }
 
   // ---------- 控制点操作 ----------
@@ -210,17 +236,22 @@
   }
 
   // ---------- 绘制 ----------
-  function drawPlaceholder(canvas, text) {
+  function drawPlaceholder(canvas, text, sub) {
     canvas.width = 640;
     canvas.height = 360;
-    const ctx = canvas.getContext('2d');
+    const ctx = canvas.getContext ? canvas.getContext('2d') : null;
+    if (!ctx) return;
     ctx.fillStyle = '#1e293b';
     ctx.fillRect(0, 0, canvas.width, canvas.height);
     ctx.fillStyle = '#64748b';
     ctx.font = '20px system-ui, sans-serif';
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
-    ctx.fillText(text, canvas.width / 2, canvas.height / 2);
+    ctx.fillText(text, canvas.width / 2, sub ? canvas.height / 2 - 14 : canvas.height / 2);
+    if (sub) {
+      ctx.font = '14px system-ui, sans-serif';
+      ctx.fillText(sub, canvas.width / 2, canvas.height / 2 + 18);
+    }
   }
 
   function drawMarker(ctx, p, label, color, scale, opts) {
@@ -504,6 +535,201 @@
     renderFitPanel();
     renderTable();
     renderButtons();
+    renderDiff();
+  }
+
+  // ---------- 差异区域视图 ----------
+  state.diffResult = null;   // 最近一次差异分析结果（含 labels/regions）
+  state.diffError = null;    // 参数非法等错误提示（中文）
+
+  // 读取图像原始 RGBA（本地 canvas，不上传服务器）
+  function readImageRGBA(img) {
+    const w = img.naturalWidth, h = img.naturalHeight;
+    const c = document.createElement('canvas');
+    c.width = w; c.height = h;
+    const g = c.getContext('2d');
+    g.drawImage(img, 0, 0);
+    return { w, h, data: g.getImageData(0, 0, w, h).data };
+  }
+
+  function matrixKey(m) {
+    return m ? ['a', 'b', 'c', 'd', 'e', 'f'].map((k) => Number(m[k])).join(',') : '';
+  }
+
+  // 校准扫描图 RGBA 重采样（与参考图同尺寸）：图像与矩阵不变时复用缓存，
+  // 差异视图与「导出校准扫描图 PNG」共用同一份 transformRGBA 结果
+  function getCalibratedRGBA() {
+    const ready = exportImageReadiness();
+    if (!ready.ok) return { error: ready.reason };
+    const refImg = state.refImg, scanImg = state.scanImg;
+    const key = matrixKey(state.fit.matrix);
+    const outW = refImg.naturalWidth, outH = refImg.naturalHeight;
+    const token = `${refImg.imageToken}|${scanImg.imageToken}`;
+    if (calibratedCache && calibratedCache.token === token &&
+        calibratedCache.matrixKey === key &&
+        calibratedCache.outW === outW && calibratedCache.outH === outH) {
+      return { w: outW, h: outH, pixels: calibratedCache.pixels, cached: true };
+    }
+    const src = readImageRGBA(scanImg);
+    const pixels = Affine.transformRGBA(src.data, src.w, src.h, state.fit.matrix, outW, outH);
+    calibratedCache = { token, matrixKey: key, outW, outH, pixels };
+    return { w: outW, h: outH, pixels, cached: false };
+  }
+
+  // 差异视图不可用原因（复用校准扫描图导出的前置条件）
+  function diffUnavailableReason() {
+    if (!state.refImg || !state.scanImg) {
+      return '请先加载参考图与扫描图，差异区域需要两图对齐后逐像素比较。';
+    }
+    if (state.fitError) return '当前拟合无效（' + state.fitError + '），无法重采样校准扫描图。';
+    if (!state.fit) {
+      return `控制点不足 ${Affine.MIN_POINTS} 对，尚无可导出的拟合矩阵，无法比较差异。`;
+    }
+    const chk = Affine.checkExportMatrix(state.fit.matrix);
+    if (!chk.ok) return '当前拟合矩阵不可用于重采样：' + chk.reason;
+    return null;
+  }
+
+  // 防抖调度：拖动点位等高频变化时合并像素级计算
+  function scheduleDiffUpdate() {
+    if (diffTimer) clearTimeout(diffTimer);
+    diffTimer = setTimeout(() => {
+      diffTimer = null;
+      updateDiffView();
+    }, DIFF_DEBOUNCE_MS);
+  }
+
+  function updateDiffView() {
+    state.diffResult = null;
+    state.diffError = null;
+
+    const reason = diffUnavailableReason();
+    if (reason) { renderDiff(); return; }
+
+    const threshold = parseFloat(diffThresholdInput.value);
+    const minArea = parseFloat(diffMinAreaInput.value);
+    if (!Number.isFinite(threshold) || threshold < 0 || threshold > 255) {
+      state.diffError = 'RGB 差值阈值必须为 0~255 的数字。';
+      renderDiff();
+      return;
+    }
+    if (!Number.isFinite(minArea) || minArea < 0) {
+      state.diffError = '最小区域面积必须为不小于 0 的数字（像素）。';
+      renderDiff();
+      return;
+    }
+    state.diffThreshold = threshold;
+    state.diffMinArea = minArea;
+
+    try {
+      const cal = getCalibratedRGBA();
+      if (cal.error) { renderDiff(); return; }
+      const ref = readImageRGBA(state.refImg);
+      // 复用校准扫描图的 transformRGBA 重采样结果与参考图逐像素比较
+      state.diffResult = Affine.diffRegionsRGBA(
+        cal.pixels, ref.data, cal.w, cal.h, threshold, Math.floor(minArea));
+    } catch (err) {
+      state.diffError = '差异分析失败：' + (err.message || String(err));
+    }
+    renderDiff();
+  }
+
+  function drawDiffBox(ctx, x0, y0, x1, y1, label, scale, emphasize) {
+    const lw = emphasize ? 2.5 * scale : 1.5 * scale;
+    ctx.save();
+    ctx.lineWidth = lw;
+    ctx.strokeStyle = COLOR_DIFF_BOX;
+    ctx.setLineDash(emphasize ? [] : [6 * scale, 3 * scale]);
+    ctx.strokeRect(x0 + 0.5, y0 + 0.5, x1 - x0, y1 - y0);
+    ctx.setLineDash([]);
+    ctx.font = `bold ${12 * scale}px system-ui, sans-serif`;
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'bottom';
+    const tx = x0 + 3 * scale, ty = y0 - 3 * scale;
+    ctx.lineWidth = 3 * scale;
+    ctx.strokeStyle = 'rgba(0,0,0,0.8)';
+    ctx.strokeText(label, tx, ty);
+    ctx.fillStyle = emphasize ? '#fecaca' : COLOR_DIFF_BOX;
+    ctx.fillText(label, tx, ty);
+    ctx.restore();
+  }
+
+  function renderDiff() {
+    // 条件失效：清空旧标记（占位画布 + 空表 + 原因说明）
+    const unavailable = diffUnavailableReason();
+    if (unavailable) {
+      diffTableBody.innerHTML = '';
+      diffHintEl.textContent = unavailable;
+      drawPlaceholder(diffCanvas, '差异区域暂不可用',
+        !state.refImg || !state.scanImg ? '需先加载两张图像' : '需先得到可导出的拟合矩阵');
+      return;
+    }
+    if (state.diffError) {
+      diffTableBody.innerHTML = '';
+      diffHintEl.textContent = state.diffError;
+      drawPlaceholder(diffCanvas, '差异区域参数无效', state.diffError);
+      return;
+    }
+    if (!state.diffResult) {
+      // 计算进行中（防抖窗口）：保留旧遮罩前先清画布并提示
+      diffTableBody.innerHTML = '';
+      diffHintEl.textContent = '正在更新差异区域…';
+      drawPlaceholder(diffCanvas, '差异区域更新中…');
+      return;
+    }
+
+    const r = state.diffResult;
+    const img = state.refImg;
+    if (diffCanvas.width !== img.naturalWidth || diffCanvas.height !== img.naturalHeight) {
+      diffCanvas.width = img.naturalWidth;
+      diffCanvas.height = img.naturalHeight;
+    }
+    const ctx = diffCanvas.getContext('2d');
+    ctx.drawImage(img, 0, 0);
+
+    // 差异像素红色遮罩（labels > 0 仅为通过面积过滤的区域）
+    // putImageData 会整体覆盖而非 alpha 合成，故经离屏 canvas + drawImage 叠加
+    const w = r.width, h = r.height;
+    const maskCanvas = document.createElement('canvas');
+    maskCanvas.width = w; maskCanvas.height = h;
+    const mctx = maskCanvas.getContext('2d');
+    const mask = mctx.createImageData(w, h);
+    for (let p = 0; p < w * h; p++) {
+      if (r.labels[p] > 0) {
+        const o = p * 4;
+        mask.data[o] = 239; mask.data[o + 1] = 68; mask.data[o + 2] = 68;
+        mask.data[o + 3] = 140;
+      }
+    }
+    mctx.putImageData(mask, 0, 0);
+    ctx.drawImage(maskCanvas, 0, 0);
+
+    const scale = canvasScale(diffCanvas);
+    r.regions.forEach((g) => {
+      drawDiffBox(ctx, g.bounds.x0, g.bounds.y0, g.bounds.x1 + 1, g.bounds.y1 + 1,
+        String(g.rank), scale, g.rank === 1);
+    });
+
+    const fmtInt = (v) => v.toLocaleString('zh-CN');
+    diffHintEl.textContent =
+      `参与比较像素（双方 alpha ≥ 128）：${fmtInt(r.comparedPixels)} · ` +
+      `差异像素：${fmtInt(r.diffPixels)} · 连通区域：${r.componentCount} 个` +
+      (r.filteredOutCount > 0
+        ? `（已按最小面积 ${r.minArea} 像素过滤 ${r.filteredOutCount} 个）`
+        : `（最小面积 ${r.minArea} 像素，无区域被过滤）`) +
+      ` · 展示区域：${r.regions.length} 个 · 阈值：RGB 任一通道差值 > ${r.channelThreshold}`;
+
+    diffTableBody.innerHTML = r.regions.map((g) => {
+      const b = g.bounds;
+      const bw = b.x1 - b.x0 + 1, bh = b.y1 - b.y0 + 1;
+      return `<tr>
+        <td>${g.rank}</td>
+        <td>${fmtInt(g.pixels)}</td>
+        <td>(${b.x0}, ${b.y0}, ${bw}×${bh})</td>
+        <td>${b.x0} – ${b.x1}</td>
+        <td>${b.y0} – ${b.y1}</td>
+      </tr>`;
+    }).join('');
   }
 
   // ---------- 导出 ----------
@@ -589,20 +815,15 @@
       return;
     }
     try {
-      // 点击时重新读取当前扫描图像素（本地 canvas，不上传服务器）
-      const sw = state.scanImg.naturalWidth;
-      const sh = state.scanImg.naturalHeight;
-      const srcCanvas = document.createElement('canvas');
-      srcCanvas.width = sw;
-      srcCanvas.height = sh;
-      const sctx = srcCanvas.getContext('2d');
-      sctx.drawImage(state.scanImg, 0, 0);
-      const srcData = sctx.getImageData(0, 0, sw, sh).data;
-
-      // 输出尺寸 = 参考图原始宽高；逆仿射重采样（四邻双线性插值）
+      // 输出尺寸 = 参考图原始宽高；复用差异视图同一份逆仿射重采样结果（未计算过则现算）
       const outW = state.refImg.naturalWidth;
       const outH = state.refImg.naturalHeight;
-      const pixels = Affine.transformRGBA(srcData, sw, sh, state.fit.matrix, outW, outH);
+      const cal = getCalibratedRGBA();
+      if (cal.error) { // 理论上 readiness 已拦截，此处兜底
+        setStatus('无法导出校准扫描图：' + cal.error, 'error');
+        return;
+      }
+      const pixels = cal.pixels;
 
       const outCanvas = document.createElement('canvas');
       outCanvas.width = outW;
@@ -674,6 +895,9 @@
 
     const refImg = new Image();
     const scanImg = new Image();
+    refImg.imageToken = ++imageSeq;
+    scanImg.imageToken = ++imageSeq;
+    calibratedCache = null;
     let loaded = 0;
     const done = () => {
       loaded += 1;
@@ -729,6 +953,10 @@
       const btn = e.target.closest('button.del');
       if (btn) deletePoint(Number(btn.dataset.id));
     });
+
+    // 差异区域：阈值 / 最小面积变化后刷新（非法值立即清空旧标记并说明）
+    diffThresholdInput.addEventListener('input', scheduleDiffUpdate);
+    diffMinAreaInput.addEventListener('input', scheduleDiffUpdate);
 
     window.addEventListener('keydown', (e) => {
       if (e.key === 'Escape' && (state.pending.ref || state.pending.scan)) {

@@ -30,6 +30,12 @@
  * 越界邻点视为透明黑；颜色先乘 alpha 再插值、输出时还原，alpha 为零时
  * RGB 归零；各通道四舍五入到 0~255。矩阵含非有限值或线性部分行列式绝对值
  * ≤ MIN_MATRIX_DET（1e-12）时拒绝（checkExportMatrix / invertMatrix）。
+ *
+ * 差异区域分析（diffRegionsRGBA，可独立调用）：逐像素比较两张同尺寸 RGBA
+ * 图（一张为 transformRGBA 重采样后的校准扫描图，另一张为参考图），仅统计
+ * 双方 alpha 均 ≥ DIFF_ALPHA_MIN（128）的像素，任一 RGB 通道绝对差值严格
+ * 大于可调阈值即标记为差异；对差异掩码做八邻域连通分组（并查集两遍标记），
+ * 过滤像素数小于可调最小面积的区域，剩余区域按面积降序返回边框与像素数。
  */
 (function (root, factory) {
   const api = factory();
@@ -49,6 +55,8 @@
   const DEFAULT_TOLERANCE_PX = 2;
   // 像素变换/导出可用性的矩阵阈值：线性部分行列式 |a·e − b·d| 下限
   const MIN_MATRIX_DET = 1e-12;
+  // 差异区域：双方 alpha 均达到该值的像素才参与比较
+  const DIFF_ALPHA_MIN = 128;
 
   class FitError extends Error {
     constructor(code, message) {
@@ -515,6 +523,152 @@
     return out;
   }
 
+  /**
+   * 差异区域分析（可独立调用，纯像素计算，不依赖 DOM/Canvas）。
+   *
+   * 逐像素比较两张同尺寸 RGBA 图（典型用法：a 为 transformRGBA 重采样得到
+   * 的校准扫描图，b 为参考图）：
+   *   - 仅统计双方 alpha 均 ≥ DIFF_ALPHA_MIN（128）的像素（其余不计入差异，
+   *     也不计入 comparedPixels）；
+   *   - 参与比较的像素中，任一 RGB 通道绝对差值严格大于 channelThreshold
+   *     即标记为差异像素（|R|>t 或 |G|>t 或 |B|>t，t=阈值时不算差异）；
+   *   - 对差异掩码做八邻域（含对角）连通分组，使用并查集两遍标记；
+   *   - 过滤像素数小于 minArea 的连通区域（minArea ≤ 1 时不过滤）；
+   *   - 保留区域按像素数（面积）降序排列，平局按 y0、x0 升序，保证可复现。
+   *
+   * @param {Uint8Array|Uint8ClampedArray} a 图 A RGBA（长度 w·h·4）
+   * @param {Uint8Array|Uint8ClampedArray} b 图 B RGBA（长度 w·h·4）
+   * @param {number} w 图宽（正整数）
+   * @param {number} h 图高（正整数）
+   * @param {number} channelThreshold RGB 通道差值阈值（0~255，差异为严格大于）
+   * @param {number} minArea 最小区域面积（非负整数，面积 < 该值的区域被过滤）
+   * @returns {{width:number, height:number, channelThreshold:number, minArea:number,
+   *            comparedPixels:number, diffPixels:number,
+   *            componentCount:number, filteredOutCount:number,
+   *            regions:Array<{rank:number, pixels:number, bounds:{x0:number,y0:number,x1:number,y1:number}}>,
+   *            labels:Int32Array}}
+   *          labels 长度 w·h：0 = 非差异（或未参与比较）；> 0 为该差异像素
+   *          所属保留区域的 1 起编号（被过滤区域为 0）。
+   * @throws {FitError} code = BAD_INPUT
+   */
+  function diffRegionsRGBA(a, b, w, h, channelThreshold, minArea) {
+    if (!a || !b || !Number.isInteger(w) || !Number.isInteger(h) || w <= 0 || h <= 0) {
+      throw new FitError('BAD_INPUT', '图像数据缺失或宽高非法');
+    }
+    const n = w * h;
+    if (a.length !== n * 4 || b.length !== n * 4) {
+      throw new FitError('BAD_INPUT', '两张图像长度必须相等且与宽高相符（w·h·4）');
+    }
+    if (!Number.isFinite(channelThreshold) || channelThreshold < 0 || channelThreshold > 255) {
+      throw new FitError('BAD_INPUT', 'RGB 通道差值阈值必须为 0~255 的数字');
+    }
+    if (!Number.isFinite(minArea) || minArea < 0) {
+      throw new FitError('BAD_INPUT', '最小区域面积必须为不小于 0 的数字');
+    }
+
+    // ---- 第一遍：差异掩码 + 八邻域连通（并查集）----
+    const parent = new Int32Array(n).fill(-1); // -1：非差异像素
+    const find = (x) => {
+      let r = x;
+      while (parent[r] !== r) r = parent[r];
+      while (parent[x] !== r) { const nx = parent[x]; parent[x] = r; x = nx; } // 路径压缩
+      return r;
+    };
+
+    let comparedPixels = 0;
+    let diffPixels = 0;
+    for (let y = 0; y < h; y++) {
+      const rowBase = y * w;
+      for (let x = 0; x < w; x++) {
+        const p = rowBase + x;
+        const o = p * 4;
+        if (a[o + 3] < DIFF_ALPHA_MIN || b[o + 3] < DIFF_ALPHA_MIN) continue;
+        comparedPixels++;
+        const dr = Math.abs(a[o] - b[o]);
+        const dg = Math.abs(a[o + 1] - b[o + 1]);
+        const db = Math.abs(a[o + 2] - b[o + 2]);
+        if (dr <= channelThreshold && dg <= channelThreshold && db <= channelThreshold) continue;
+
+        // 与已扫描的四个八邻点（上、左上、右上、左）合并即可覆盖八邻域
+        const roots = [];
+        if (y > 0) {
+          const up = p - w;
+          if (parent[up] >= 0) roots.push(find(up));
+          if (x > 0 && parent[up - 1] >= 0) roots.push(find(up - 1));
+          if (x + 1 < w && parent[up + 1] >= 0) roots.push(find(up + 1));
+        }
+        if (x > 0 && parent[p - 1] >= 0) roots.push(find(p - 1));
+
+        if (roots.length === 0) {
+          parent[p] = p;
+        } else {
+          let r = roots[0];
+          for (let k = 1; k < roots.length; k++) {
+            const rk = roots[k];
+            if (rk !== r) {
+              if (rk < r) { parent[r] = rk; r = rk; } else { parent[rk] = r; }
+            }
+          }
+          parent[p] = r;
+        }
+        diffPixels++;
+      }
+    }
+
+    // ---- 第二遍：按连通根聚合像素数与边框 ----
+    const agg = new Map(); // root(最终根) → {pixels,x0,y0,x1,y1}
+    for (let p = 0; p < n; p++) {
+      if (parent[p] < 0) continue;
+      const r = find(p);
+      let g = agg.get(r);
+      if (!g) {
+        g = { pixels: 0, x0: w, y0: h, x1: -1, y1: -1 };
+        agg.set(r, g);
+      }
+      g.pixels++;
+      const x = p % w, y = (p / w) | 0;
+      if (x < g.x0) g.x0 = x;
+      if (x > g.x1) g.x1 = x;
+      if (y < g.y0) g.y0 = y;
+      if (y > g.y1) g.y1 = y;
+    }
+
+    const all = [...agg.entries()]
+      .map(([root, g]) => ({ root, pixels: g.pixels, x0: g.x0, y0: g.y0, x1: g.x1, y1: g.y1 }))
+      .sort((s, t) => t.pixels - s.pixels || s.y0 - t.y0 || s.x0 - t.x0);
+    const minA = Math.max(1, Math.floor(minArea));
+    const kept = all.filter((g) => g.pixels >= minA);
+
+    // ---- 重写 labels：保留区域为 1 起编号（按面积降序），其余归零 ----
+    // 注意：labels 不能就地复用 parent——find 仍依赖并查集结构，提前覆写会成环
+    const labels = new Int32Array(n);
+    const rootToRank = new Map();
+    kept.forEach((g, i) => {
+      g.rank = i + 1;
+      rootToRank.set(g.root, g.rank);
+    });
+    for (let p = 0; p < n; p++) {
+      if (parent[p] >= 0) labels[p] = rootToRank.get(find(p)) || 0;
+    }
+
+    return {
+      width: w,
+      height: h,
+      channelThreshold,
+      minArea: Math.floor(minArea),
+      comparedPixels,
+      diffPixels,
+      componentCount: all.length,
+      filteredOutCount: all.length - kept.length,
+      regions: kept.map((g) => ({
+        rank: g.rank,
+        pixels: g.pixels,
+        bounds: { x0: g.x0, y0: g.y0, x1: g.x1, y1: g.y1 }
+      })),
+      labels
+    };
+  }
+
   return {
     fitAffine,
     fitAffineRobust,
@@ -524,12 +678,14 @@
     checkExportMatrix,
     invertMatrix,
     transformRGBA,
+    diffRegionsRGBA,
     FitError,
     MIN_POINTS,
     COLLINEAR_RATIO,
     MAX_CANDIDATES,
     MAX_REFINE_ITERS,
     DEFAULT_TOLERANCE_PX,
-    MIN_MATRIX_DET
+    MIN_MATRIX_DET,
+    DIFF_ALPHA_MIN
   };
 });

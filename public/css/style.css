@@ -193,4 +193,27 @@ button.del {
 .opacity-row input[type="range"] { width: 260px; accent-color: var(--accent); }
 #opacityVal { color: var(--muted); min-width: 42px; }
 
+/* 差异区域视图 */
+.diff-wrap { margin-top: 24px; }
+.diff-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+.diff-controls input[type="number"] {
+  width: 72px;
+  padding: 3px 6px;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-size: 13px;
+}
+.diff-controls .diff-rule { flex: 1; min-width: 260px; }
+.diff-wrap canvas { cursor: default; }
+.diff-table-title { font-size: 14px; margin: 14px 0 6px; color: var(--text); }
+#diffTable td:first-child { color: #f87171; font-weight: 700; }
+
 footer { margin-top: 28px; color: var(--muted); font-size: 12px; }

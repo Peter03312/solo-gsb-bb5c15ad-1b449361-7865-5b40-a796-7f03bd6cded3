@@ -75,6 +75,33 @@
     <canvas id="overlayCanvas"></canvas>
   </section>
 
+  <section class="diff-wrap">
+    <h2>差异区域</h2>
+    <div class="diff-controls">
+      <label class="tol-label" title="仅双方 alpha ≥ 128 的像素参与比较；任一 RGB 通道差值严格大于该阈值即标为差异">
+        RGB 差值阈值
+        <input type="number" id="diffThreshold" min="0" max="255" step="1" value="32">
+      </label>
+      <label class="tol-label" title="八邻域连通分组后，像素数小于该值的差异区域将被过滤">
+        最小区域面积
+        <input type="number" id="diffMinArea" min="0" step="1" value="20">
+        像素
+      </label>
+      <span class="muted diff-rule">仅统计校准扫描图与参考图双方 alpha 均 ≥ 128 的像素；红色遮罩为全部差异像素，编号矩形为通过面积过滤的连通区域（八邻域）。</span>
+    </div>
+    <div id="diffHint" class="export-hint"></div>
+    <canvas id="diffCanvas"></canvas>
+    <h3 class="diff-table-title">差异区域列表（按面积降序，坐标为参考图像素）</h3>
+    <table id="diffTable">
+      <thead>
+        <tr>
+          <th>#</th><th>像素数</th><th>边框 (x, y, w, h)</th><th>参考图 x 范围</th><th>参考图 y 范围</th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+  </section>
+
   <footer>
     <p>仿射最小二乘拟合在浏览器本地完成；图像不会上传服务器。POST /api/fit 提供同样的拟合接口供程序化调用。</p>
   </footer>
